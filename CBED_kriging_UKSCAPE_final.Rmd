@@ -1,0 +1,646 @@
+---
+title: "Spatial interpolation using kriging"
+author: "Beth Raine elirai@ceh.ac.uk"
+date: "22/08/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+
+#install rCBED if not currently installed:
+#install.packages("devtools")
+#library(devtools)
+#install_github("NERC-CEH/rCBED", auth_token = "9be9c01caa2ba0adce87690587952d75301cf034")
+library(rCBED)
+# always load rCBED before tidyr 
+
+library(raster)
+library(ggplot2)
+library(devtools)
+library(spCEH)
+library(gstat)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(RColorBrewer)
+library(rgdal)
+library(lubridate)
+library(randomForest)
+library(mgcv)
+library(ggpubr)
+library(gstat)
+library(tidyselect)
+library(tidyr)
+library(dplyr)
+library(viridis)
+theme_set(theme_classic())
+
+set.seed(1)
+
+# Includes raster stacks for the years 2001 - 2016 for EMEP and FRAME wet and dry concentration of NH4. 
+load("../ukscape_nh4.rData")
+
+# creating a world map for plotting
+world <- ne_countries(scale="medium", returnclass="sf")
+world <- sf::st_as_sf(world, coords=c("x","y"), crs = 27700, agr = "constant", remove = F)
+
+# colour palette for in ggplot
+cols <- terrain.colors(10)
+cols <- cols[10:1]
+
+### map of UK as a background for plots
+r_UK <- getRasterTemplate("UK", proj=projOSGB, res=1000)
+values(r_UK) <- 1
+r_UK <- maskByCountry(r_UK, c("England", "Scotland", "Wales", "Northern Ireland"))
+df_UK <- as.data.frame(rasterToPoints(r_UK))
+colnames(df_UK) <- c("x", "y", "val")
+
+# dfConcInPpt_obs is the monitoring site data contained within CBED - selecting just NH4 from this data.
+df_ConcInPpt_NH4_obs <- subset(df_ConcInPpt_obs, parameter.id == "NH4")
+df_ConcInAir_NH4_obs <- subset(df_ConcInAir_obs, parameter.id == "NH4")
+
+## prepare altitude data:
+
+names(r_alt) <- "altitude"
+r_alt <- raster::aggregate(r_alt, 5)
+r_alt <- resample(r_alt, NH4_2016r_x)
+r_alt <- crop(r_alt, extent(NH4_2016r_x))
+NH4_2016r_x <- crop(NH4_2016r_x, extent(r_alt))
+
+```
+
+
+
+## Introduction
+
+This RMarkdown describes statistical approaches to interpolation, namely ordinary kriging and regression kriging and how these methods can be used to improve the interpolation of spatially explicit data. It uses the CBED pollutant concentration and deposition model as an example for how these methods can be applied.
+
+*Ordinary kriging*
+
+In ordinary kriging spatial interpolation is carried out by modelling the response variable as a function of distance. This is based on empirical observations used to estimate the value of the variable over a continuous spatial field. This modelling approach uses a variogram which estimates the spatial covariance structure of the sampled points. The variogram is then used to estimate weights from this covariance structure in order to interpolate the response variable for the unsampled points in the spatial field.
+
+*Regression kriging*
+
+Regression kriging adds an additional step to ordinary kriging. First, a regression model is fit to estimate the association between the response variable and explanatory variable(s). Then, kriging is applied to the residuals from the regression model. This method should enable better estimation of the response variable: by including explanatory variables that are thought/known to influence the response variable's distribution. The kriging stage of the method effectively "mops up" any remaining stochastic spatial structure in the data that is not accounted for in the regression. 
+
+*Assumptions*
+
+Ordinary or regression kriging will only be more effective than a more simple interpolation method if there is spatial autocorrelation in the data. In addition, kriging assumes stationary (the same variogram is valid across the study space) and isotropy (uniformity in all directions) in the structure of the data. For regression kriging to be more effective than simpler ordinary kriging, the explanatory variables included in the model must explain variation in the response variable.
+
+## When to use kriging
+
+Ordinary kriging is a suitable method to use if you:
+
+- Want to extrapolate a variable from spatially explicit point samples to a larger spatial area.
+
+Regression kriging is a suitable method to use if you *also*:
+
+- Have additional explanatory variable(s) that may correlate with the response variable AND
+
+- Have data for these explanatory variable(s) at the same spatially explicit point samples AND
+
+- Have a raster of the explanatory variable(s) across the spatial area you wish to interpolate your response variable over.
+
+
+Here we demonstrate the use of regression kriging to improve estimates of pollutant concentration in the CBED model.
+
+## CBED
+
+Concentration Based Emissions Deposition (CBED) is a model that uses UK national monitoring site data on the air concentration of pollutants to derive air concentration and pollutant deposition maps for the UK. Currently, CBED uses ordinary kriging to linearly interpolate between the monitoring station values for each pollutant to provide a UK wide spatial estimate of pollutant concentration and deposition at the 1km resolution..
+
+EMEP4-UK is another atmospheric chemistry transport model for the UK that estimate pollutant concentrations based on emissions activity, meterology .
+Here, we want to test whether integrating the pollutant concentration distributions modelled in EMEP4-UK into the measurement site data using regression kriging can improve how well the pollutant is interpolated across the rest of the UK. As emissions data currently is not integrated into the CBED method, incorporating this data may improve the estimate of pollutant deposition beyond the simple weighted interpolation from ordinary kriging alone.
+
+Using regression kriging, a regression model will be fit based on the data from monitoring stations for the pollutant in question and the pollution concentration estimates of EMEP4-UK at these points. It will use the monitored value as the response variable and the modelled values from EMEP4-UK as the explanatory variables. Kriging is then carried out using the residuals of the model fit, in order to identify any additional spatial pattern in the data that is not captured in the model. This is then used to interpolate pollutant deposition values across the UK. The assumption made here is that EMEP4-UK provides quantitatively more accurate/ entirely accurate estimates of pollutant concentration across the UK than what can be estimated from monitoring sites alone.
+
+The figure below shows the output of CBED for ordinary kriging for NH4. The points represent the concentration at the monitoring stations used in the ordinary kriging. Only the monitoring station data has been used to interpolate across the map of the UK.
+
+```{r CBED example, echo=TRUE, warning=FALSE, error= FALSE, messages=FALSE}
+
+# set the date: CBED is annual so any day within the year will return the same result
+datect <- as.POSIXct("2016/06/01",tz="GMT")
+
+# the getConcInPpt function performs ordinary kriging in the CBED package.
+r_cbed_nh4 <- getConcInAir("NH4", datect)
+
+```
+
+```{r, echo= FALSE, warning= FALSE, error= FALSE, messages = FALSE}
+
+# remove the non land areas of the map
+r_cbed_nh4 <- maskByCountry(r_cbed_nh4, c("England", "Scotland", "Wales", "Northern Ireland"))
+
+# convert into a version we can plot in ggplot
+sp_cbed_nh4 <- as(r_cbed_nh4, "SpatialPixelsDataFrame")
+df_cbed_nh4 <- as.data.frame(sp_cbed_nh4)
+colnames(df_cbed_nh4) <- c("Concentration", "x", "y")
+
+# subset the monitoring site observation data to those collected within the year of 2016
+earliestDate <- datect - as.difftime(183, units = "days")
+latestDate   <- datect + as.difftime(183, units = "days")
+
+df_NH4_obs_2016 <- subset(df_ConcInAir_NH4_obs, datect > earliestDate & datect < latestDate)
+projection(df_NH4_obs_2016) <- projOSGB
+
+df_NH4_obs_2016 <- as.data.frame(df_NH4_obs_2016)
+```
+
+The outputs give us the concentration of NH4 in rainfall as estimated through ordinary kriging in CBED for the year 2016. We can compare this interpolated estimate with the monitoring site concentrations and see areas where the interpolation closely follows monitoring site data, as well as some instances where it diverges. It may be possible to improve the interpolation to reflect the monitoring site data by incorporating additional datasets.
+
+
+```{r plotting cbed, echo=FALSE, error=FALSE, warning=FALSE}
+
+a <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+  geom_tile(data= df_cbed_nh4, aes(x=x, y=y, fill= Concentration)) +
+  geom_point(data=df_NH4_obs_2016, aes(x=Easting_m, y=Northing_m,  fill=Concentration), pch=21, colour = "black") +
+  scale_fill_gradientn(colours=cols, name= "NH4 concentration (mg/l)") +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("CBED ordinary kriging")
+
+b <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+    geom_tile(data= df_UK, aes(x=x, y=y), fill="black") +
+  geom_point(data=df_NH4_obs_2016, aes(x=Easting_m, y=Northing_m,  colour=Concentration), pch=19) +
+  scale_fill_gradientn(colours=cols, "NH4 concentration (mg/l)") +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("Monitoring station NH4 conc.")
+
+ggarrange(a,b, ncol=2, nrow=1, common.legend=TRUE, legend="bottom") 
+```
+
+### Regression kriging method
+
+**1. Compile a spatial points dataframe of observations:**
+
+This should contain both the response variable and the explanatory variables of interest. This needs to be spatially explicit (hence the spatial points data frame). In the CBED example, this is a spatial points dataframe of data collected at the pollutant monitoring sites around the UK. 
+
+*Note:* It's important that there are no duplicated sample coordinates in this spatial points dataframe as the variogram will not fit properly. If you have duplicated sample coordinates in your dataset, you will need to remove the duplicates.
+
+**2. Compile rasters of explanatory variables:** 
+
+This involves compiling the explanatory variable(s) (in the CBED example this is the raster layers of the UK for the wet and dry concentrations of NH4 from EMEP4-UK) in a raster stack. This will be used when carrying out the interpolation stage of regression kriging. 
+
+*Note:* It’s important that the names of the layers of the final raster stack created here are the same as the column names used in the spatial points dataframe defined in Step 1.
+
+**4. Perform ordinary kriging:**
+
+To assess whether regression kriging is the best method for interpolation, carry out ordinary kriging first as a comparison.
+
+**5. Fitting regression kriging:** 
+
+Fit a regression model using the spatial points dataframe. The model could take one of many forms and be estimated with different methods: here we test using linear models, generalised linear models and random forest. In the case of CBED, the model fit will be the pollutant concentration measured at the monitoring sites as the response variable, predicted by the pollutant concentration estimates for the same site in EMEP4-UK.
+
+Here we use linear models (LM): LMs are appropriate if you have a linear relationship between your explanatory variable(s) and your response variable. The data must be normally distributed, observations must be independent of one another, and the data must show homoscedasticity (the variance of the residual is the same for any response variable value)
+
+
+**6. Extract the residuals and regression kriging:** 
+
+We extract the residual values from the regression model fit and use these to fit a variogram which estimates how the concentration of the pollutant varies with distance from each monitoring station. (In the example given below, we separate out the model fitting and kriging stage so that we can compare between using just the model fit for the interpolation versus regression kriging.)
+
+**7. Perform model evaluation:**
+
+Estimate Root Mean Square Error (RMSE) for each of the regression models fitted to identify the best model fit. This will tell us whether regression kriging is superior to ordinary kriging in estimating NH4 concentration, or whether ordinary kriging gives a sufficient estimate.
+
+$RMSE = \sqrt{\sum_{i=1}^n \frac{(\hat{y}_i - y_i)^2}{n}}$
+
+Where $\hat{y}_i ... \hat{y}_n$ are predicted values and $y_i ... y_n$ are observed values, with $n$ being the number of observations.
+
+**8. Carrying out interpolation:**
+
+Here we apply regression kriging/ ordinary kriging/ linear model fit depending on which is superior based on RMSE.
+
+
+### Example: Dry deposition of NH4
+
+Here we will fit the models for the concentration of NH4 in dry deposition (from the air).
+
+The monitoring site dataset across the UK records concentrations of these pollutants over time - not all pollutants have been monitored consistently over time.
+
+```{r, echo=FALSE, warning= FALSE, error = FALSE, messages = FALSE}
+
+# All monitoring site data for air NH4 readings
+df <- as.data.frame(df_ConcInAir_NH4_obs)
+
+# group readings to identify number of monitoring sites recording NH4
+df_sum <- df %>% group_by(Year) %>% dplyr::summarise(n=length(Site.Name))
+
+a <- ggplot(df_sum, aes(x=Year,y=n)) +
+  geom_bar(stat="identity", alpha=0.3, position="identity", boundary=0) +
+  xlab("Year") +
+  ylab("No. monitoring station readings") +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0))
+
+b <- ggplot(df, aes(x=Concentration)) +
+  geom_histogram(alpha=0.3, position="identity") +
+  scale_x_continuous(limits=c(0,2.2), expand=c(0,0)) +
+  ylab("Frequency") +
+  xlab("Concentration")+
+  scale_y_continuous(expand=c(0,0))
+
+ggarrange(a,b, ncol=2, nrow=1)
+
+```
+
+
+
+**1. Extract predicted values for pollutant from EMEP and FRAME at monitoring site locations:**
+
+The code below adds the wet deposition of NH4 (wet deposition of reduced Nitrogen, mgN/m2) and the dry deposition of NH4 (near surface concentration of ammonium particulate, µg m-3) to the spatial points dataframe of the monitoring site data. 
+
+```{r, echo=TRUE, warning= FALSE, error= FALSE}
+
+# Select the year of interest from the full monitoring site dataset
+sp_obs <- subset(df_ConcInAir_NH4_obs, Year == "2016")
+
+# Extract data from our explanatory variable rasters at the coordinates of our monitoring sites and add this to the observations dataset
+
+# Wet deposition of Reduced nitrogen from EMEP
+sp_obs@data$EMEP_wet <- raster::extract(NH4_2016r_x$EMEP_RDN_wet, sp_obs@coords, method="simple")
+
+# dry deposition of NH4 from EMEP
+sp_obs@data$EMEP_dry <- raster::extract(NH4_2016r_x$EMEP_NH4_dry, sp_obs@coords, method="simple")
+
+# altitude
+sp_obs@data$altitude <- raster::extract(r_alt$altitude, sp_obs@coords, method="simple")
+
+# rainfall
+sp_obs@data$ppt <- raster::extract(NH4_2016r_x$ppt, sp_obs@coords, method="simple")
+
+# Remove monitoring sites that don't have observations at a site
+sp_obs <- sp_obs[!is.na(sp_obs@data$EMEP_wet),]
+sp_obs <- sp_obs[!is.na(sp_obs@data$EMEP_dry),]
+sp_obs <- sp_obs[!is.na(sp_obs@data$altitude),]
+
+# Remove duplicated coordinate points
+sp_obs <- remove.duplicates(sp_obs)
+
+# view data
+view_pol <- sp_obs@data
+knitr::kable(head(view_pol[,c(1,2,17:21)]))
+
+```
+
+
+``` {r, echo=FALSE}
+
+# viewing the monitoring site data
+df <- as.data.frame(sp_obs)
+
+ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+  geom_tile(data= df_UK, aes(x=x, y=y), fill="black") +
+  geom_point(data=df, aes(x=Easting_m, y=Northing_m,  colour=Concentration), pch=19) +
+  scale_fill_gradientn(colours=cols) +
+  scale_colour_gradientn(colours=cols) +
+  xlab("") +
+  ylab("") +
+  ggtitle("Monitoring site NH4 conc. in 2016")
+
+```
+
+
+
+**2. Creating raster stack of explanatory variables:**
+
+This involves stacking the raster layers of our explanatory variables. 
+
+```{r, echo=TRUE, warning=FALSE, error=FALSE}
+
+# first want to scale our raster variables by dividng by the mean value of the raster which will ease model fitting
+
+NH4_2016r_x$EMEP_NH4_dry <- NH4_2016r_x$EMEP_NH4_dry / mean(values(NH4_2016r_x$EMEP_NH4_dry), na.rm=T)
+
+NH4_2016r_x$ppt <- NH4_2016r_x$ppt / mean(values(NH4_2016r_x$ppt), na.rm=T)
+
+NH4_2016r_x$EMEP_RDN_wet <- NH4_2016r_x$EMEP_RDN_wet / mean(values(NH4_2016r_x$EMEP_NH4_dry), na.rm=T)
+
+r_alt$altitude <- r_alt$altitude  / mean(values(r_alt$altitude ), na.rm=T)
+
+# Create r_x for interpolation:
+r_x <- stack(NH4_2016r_x$EMEP_NH4_dry,
+             NH4_2016r_x$EMEP_RDN_wet,
+             NH4_2016r_x$ppt,
+             r_alt)
+
+# crop to just the land area of GB
+r_x <- maskByCountry(r_x, c("England", "Wales", "Scotland", "Northern Ireland"))
+
+names(r_x) <- c("EMEP_dry", "EMEP_wet" , "ppt", "altitude")
+plot(r_x)
+
+```
+
+
+
+
+**4. Perform Ordinary kriging:**
+
+This is the same process carried out by the CBED package in the getConcInPpt().
+Ordinary kriging fits the model: Concentration ~ 1 
+First, a variogram is fitted that estimates the spatial association between datapoints.
+
+```{r, warning=FALSE, error= FALSE}
+
+# A square root transformation makes the data follow a normal distribution
+par(mfrow=c(1,2))
+hist(sp_obs$Concentration)
+hist(sqrt(sp_obs$Concentration))
+
+# Fit variogram - for ordinary kriging we do not specify any explanatory variables
+v <- variogram(sqrt(Concentration) ~ 1, cutoff = 700000, width = 50000, sp_obs)      
+
+# Fit variogram model to sample variogram
+mod_ok <- fit.variogram(v, vgm(c("Lin", "Exp", "Exc", "Sph", "Gau", "Mat", "Ste")))
+
+plot(v,mod_ok, main="OK variogram")
+
+```
+
+
+Semivariance on the y axis of the variogram is the average squared difference between values of paired locations at that distance apart. In this instance, we see that with small distances between paired locations, there is a small semivariance value, indicating that locations close together have similar concentration values. As the distance between paired locations increases, the semivariance value becomes larger. This variogram predicts that as the distance increases between point locations, the semivariance will asymptote, as the distance between paired locations is large enough to no longer affect concentration.
+
+Next a gstat object is produced which is used for the spatial predictions. The area over which to perform ordinary kriging must also be specified in a raster.
+
+```{r, warning=FALSE, error=FALSE, messages= FALSE, results="hide"}
+
+# Make the gstat object - this is used for interpolation
+# specifying that the variogram model to use is the mod_ok that we defined earlier
+g <- gstat(NULL, id="NH4", formula = sqrt(Concentration) ~ 1, sp_obs, model=mod_ok)
+
+# Specify the extent to interpolate across
+fname <- system.file("extdata", "r.grd", package="rCBED")
+r <- raster(fname)
+crs(r) <- projOSGB
+
+# Perform interpolation
+r_OK <- raster::interpolate(r, g) 
+values(r_OK) <- values(r_OK)^2
+```
+
+Here we see the output of the ordinary kriging for dry deposition in 2016. The strong north east- south west gradient in concentration masks some of the variation in monitoring site concentration.
+
+```{r, echo=FALSE}
+
+# Crop to UK
+r_OK <- maskByCountry(r_OK, c("England", "Wales", "Scotland", "Northern Ireland"))
+
+sp_OK <- as(r_OK, "SpatialPixelsDataFrame")
+df_OK <- as.data.frame(sp_OK)
+colnames(df_OK) <- c("Concentration", "x", "y")
+
+df <- as.data.frame(sp_obs)
+
+a <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+  geom_tile(data= df_OK, aes(x=x, y=y, fill= Concentration)) +
+  geom_point(data=df, aes(x=Easting_m, y=Northing_m,  fill=Concentration), pch=21, colour = "black") +
+  scale_fill_gradientn(colours=cols) +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("Ordinary kriging")
+
+b <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+    geom_tile(data= df_UK, aes(x=x, y=y), fill="black") +
+  geom_point(data=df, aes(x=Easting_m, y=Northing_m,  colour=Concentration), pch=19) +
+  scale_fill_gradientn(colours=cols) +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("Monitoring site NH4 conc.")
+
+ggarrange(a,b, ncol=2, nrow=1, common.legend=TRUE, legend="bottom") 
+
+```
+
+
+**5. Regression kriging:**
+
+To carry out the regression kriging, we need to first specify a linear model. Here we use the NH4 wet and dry deposition as predicted from EMEP4UK, as well as altitude and precipitation as explanatory variables in a linear model. We perform model selection to select the best model for use in the regression kriging. Be sure to check model diagnostics. We then extract the residual values from the model and apply ordinary kriging to these values.
+
+
+```{r,  warning= FALSE, error= FALSE}
+
+df_obs <- as.data.frame(sp_obs)
+# fit model and carry out model selection
+
+lm <- glm(sqrt(Concentration) ~ EMEP_dry + EMEP_wet + altitude+ ppt, data = df_obs)
+
+summary(lm)
+drop1(lm)
+
+# I have missed out some steps here for conciseness but this is the optimal model:
+lm <- glm(sqrt(Concentration) ~ EMEP_dry, data = df_obs)
+
+summary(lm)
+drop1(lm)
+
+
+# Ordinary Kriging of GLM residuals
+# extract residuals from linear model
+sp_obs@data <- cbind(sp_obs@data, residGLM = resid(lm))
+
+
+formMod <- residGLM ~ 1
+v <- variogram(formMod, sp_obs)
+
+mod_rk <- fit.variogram(v, vgm(c("Lin", "Exp", "Exc", "Sph", "Gau", "Mat", "Ste")))
+
+
+plot(v, mod_rk,  main="RK variogram")
+
+```
+
+The variogram fit to the residuals of the glm gives the  spatial association between data points, showing that at closer distances there is a linear increase in the average squared difference between paired points. This then asymptotes indicating at larger distances there is no spatial association in concentration values amongst paired points. We are dealing with much smaller semivariance values in the regression kriging variogram compared to the ordinary kriging variogram - as the linear model fit using the EMEP4-UK data has explained some of the variation between monitoring sites before we fit the variogram to the residuals.
+
+Fitting the gstat object and specifying the explanatory rasters will allow interpolation using the EMEP explanatory variables.
+
+```{r, warning= FALSE, error= FALSE, messages = FALSE}
+
+# Make the gstat object used for interpolation
+g <- gstat(NULL, "NH4", sqrt(Concentration) ~ EMEP_dry, sp_obs, model=mod_rk)
+
+# Carry out interpolation using our raster stack of explanatory variables
+r_RK <- raster::interpolate(r_x, g, xyOnly=FALSE)
+
+# Crop to UK
+r_RK <- maskByCountry(r_RK,  c("England", "Wales", "Scotland", "Northern Ireland"))
+values(r_RK) <- sqrt(values(r_RK))
+```
+
+```{r, echo= FALSE, error = FALSE, warning = FALSE, messages = FALSE}
+
+# convert to a version we can plot in ggplot
+sp_RK <- as(r_RK, "SpatialPixelsDataFrame")
+df_RK <- as.data.frame(sp_RK)
+colnames(df_RK) <- c("Concentration", "x", "y")
+
+df <- as.data.frame(df_obs)
+
+a <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+  geom_tile(data= df_RK, aes(x=x, y=y, fill= Concentration)) +
+  geom_point(data=df, aes(x=Easting_m, y=Northing_m,  fill=Concentration), pch=21, colour="black") +
+  scale_fill_gradientn(colours=cols) +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("Regression kriging")
+
+b <- ggplot(world) +
+  coord_sf(xlim=c(0, 700000), ylim=c(0,1300000)) +
+    geom_tile(data= df_UK, aes(x=x, y=y), fill="black") +
+  geom_point(data=df, aes(x=Easting_m, y=Northing_m,  colour=Concentration), pch=19) +
+  scale_fill_gradientn(colours=cols) +
+  scale_colour_gradientn(colours=cols, guide="none") +
+  xlab("") +
+  ylab("") +
+  ggtitle("Monitoring site data")
+
+ggarrange(a,b, ncol=2, nrow=1, common.legend=TRUE, legend="bottom") 
+
+```
+
+The regression kriging output is quite different to the prediction from ordinary kriging. There is a lot more variation in NH4 concentration than a pure north east - south west divide and follows the monitoring site data more closely.
+
+**6. Compare between ordinary kriging and regression kriging:**
+
+We need a way to test which method gives a better estimate of our data. As ordinary kriging is directly reliant on monitoring site observation values, R squared values are not useful in this situation. Instead we can use cross validation which is a resamplimg method that uses different portions of the data to test and train a model on different iterations. In this case, it will sequentially omit data points from the monitoring site data and fit ordinary kriging and regression kriging to the remaining points. It then uses the models fit to predict the NH4 concentration values for the omitted monitoring site coordinates. This code calculates the root mean square error to evaluate the goodness of fit of ordinary kriging and GLM with and without regression kriging and compares the outputs.
+
+```{r plotting kriging, warning=FALSE, echo=TRUE, error= FALSE, messages = FALSE, results="hide"}
+# Specify number of cross fold validations to do:
+# this is limited by the number of datapoints that you have
+
+k=nrow(df_obs)
+
+
+# Two functions needed in cross validation:
+# Function to separate out training and test data splits
+
+kfoldSplit <- function(x, k=k, train=TRUE){
+  x <- sample(x, size = length(x), replace = FALSE)
+  out <- suppressWarnings(split(x, factor(1:k)))
+  if(train) out <- lapply(out, FUN = function(x, len) (1:len)[-x], len=length(unlist(out)))
+  return(out)
+}
+
+# Function to calculate the regression residuals
+resid.RF <- function(x) return(x$y - x$predicted)
+
+# Create output dataframe for RMSE
+evalData <- matrix(NA, nrow=k, ncol=2, 
+                   dimnames = list(1:k, c("OK","RK")))
+i=1
+for(i in 1:k){
+
+  # workout the rows to include in each of the k replicates
+  kfolds <- kfoldSplit(1:nrow(sp_obs@data), k = k, train = TRUE)
+  
+  idx <- kfolds[[i]]
+
+  # TRAIN indices as a boolean vector
+  idxBool <- (1:nrow(sp_obs@data)) %in% idx
+  ##identifies which are missing T/F
+  
+  # Observed test data for the target variable in df_obs
+  obs.test <- sp_obs@data[!idxBool, "Concentration"]
+  
+  #####################################
+  ## Ordinary Kriging ----
+  
+  # Make variogram
+  formMod <- sqrt(Concentration) ~ 1
+  
+  #variogram model, or adds to an existing model
+  variog <- variogram(formMod, sp_obs[idxBool, ])
+
+  # here fitting the variogram we are using the variogram fit to the full dataset to ensure the same spatial pattern is being adhered to across sampling iterations
+  variogFitOLS <- fit.variogram(variog, model = mod_ok,  fit.method = 6)
+  #Fit ranges and/or sills from a simple or nested variogram model to a sample variogram
+  
+  # kriging predictions
+  OK <- krige(formula = formMod ,
+              locations = sp_obs[idxBool, ], 
+              model = variogFitOLS,
+              newdata = sp_obs[!idxBool, ],
+              debug.level = 0)
+  
+  ok.pred.test <- OK@data$var1.pred^2 
+  # make sure to square our predicted value here as we square root in the variogram
+  
+  
+  # Work out the RMSE
+  evalData[i,"OK"] <- sqrt(mean((ok.pred.test - obs.test)^2))
+  
+  #############################
+  ## GLM calibration ----
+  
+  # Specify regression kriging linear model
+  GLM <- glm(formula = sqrt(Concentration) ~  EMEP_dry, data = df_obs[idxBool, ])
+
+  # Extract residuals
+  glm.pred.test <- predict(GLM, newdata = sp_obs@data[-idx,], type="response")
+  
+  # Ordinary Kriging of GLM residuals
+  
+  sp_obsTMP <- sp_obs[idxBool, ]
+  sp_obsTMP@data <- cbind(sp_obsTMP@data, residGLM = resid(GLM))
+  
+  formMod <- residGLM ~ 1
+  #mod <- vgm(c("Lin", "Exp", "Exc", "Sph", "Gau", "Mat", "Ste"))
+  variog <- variogram(formMod, sp_obsTMP)
+  
+  # Variogram fitting by Ordinary Least Sqaure
+  #again here we are using the variogram we fit previously to the full dataset 
+  variogFitOLS <- suppressMessages(fit.variogram(variog, model = mod_rk,  fit.method = 6))
+  #plot(variog, variogFitOLS, main="OLS Model")
+  
+  # kriging predictions
+  GLM.OK <- krige(formula = formMod ,
+                  locations = sp_obsTMP, 
+                  model = variogFitOLS,
+                  newdata = sp_obs[!idxBool, ],
+                  debug.level = 0)
+  
+  glm.ok.pred.test <- glm.pred.test^2 + GLM.OK@data$var1.pred^2
+  # squaring both the predicted value and the residual variation from the variogram here as our initial model was square rooted.
+  
+  evalData[i,"RK"] <- sqrt(mean((glm.ok.pred.test - obs.test)^2))
+  
+}
+
+
+```
+
+```{r, echo= TRUE}
+
+# plotting this data
+evalData <- as.data.frame(evalData)
+
+evalData <- evalData %>% gather(model, RMSE, 1:2)
+df_out <- evalData %>% group_by(model) %>% dplyr::summarise(mean_RMSE = mean(RMSE, na.rm=T), sd_RMSE = sd(RMSE, na.rm=T), se_RMSE = sd_RMSE/(sqrt(k)))
+
+ggplot() +
+  geom_jitter(data = evalData, aes(x=model, y= RMSE), width=0.2, alpha=0.2) +
+  scale_y_continuous() +
+  geom_point(data=df_out, aes(x=model, y= mean_RMSE)) +
+  geom_pointrange(data= df_out, aes(x=model, y=mean_RMSE, ymin=mean_RMSE-(2*se_RMSE), ymax=mean_RMSE + (2*se_RMSE))) +
+  xlab("Model")
+
+# fitting a simple linear model to identify whether there is a difference in the RMSE values between the two models
+
+lm_comp <- lm(RMSE ~ model, data = evalData)
+drop1(lm_comp)
+# AIC is smaller when model is included: so the RMSE predicted by the two models is different. From our figure we can se RMSE is lower for the regression kriging model. This is the optimal spatial interpolation to use.
+```
+
+From this 28 fold cross validation we can see that fitting a GLM with regression kriging gives the lowest RMSE value. Fitting a linear model to test for a difference between the RMSE values from ordinary kriging versus regression kriging shows that there is a difference between these two models.This indicates there is an improvement in the power to predict monitoring site dry NH4 deposition values from interpolation when we use regression kriging. This suggests that there is spatial variation in the dataset beyond direct interpolation between monitoring station points, which is a sensible conclusion, as the monitoring sites for NH4 across Great Britain are relatively sparse and do not capture the full extent of NH4 dry deposition.
